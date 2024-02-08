@@ -1,0 +1,484 @@
+import os
+import torch
+
+import pandas as pd
+import tqdm
+tqdm.tqdm.pandas()
+
+import torch
+from torch.utils.data import Dataset, DataLoader
+from transformers import BertTokenizer, BertModel
+import torch.nn as nn
+
+import datetime
+from skmultilearn.model_selection import iterative_train_test_split 
+import numpy as np
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
+
+def flatten(y):
+    li = []
+    for p in y:
+        list_of_lists = [tensor.tolist() for tensor in p]
+        li.append(np.array(list_of_lists).T)
+    li = np.vstack(li).T
+    return li
+
+def calc_metric(y_true, y_pred):
+    y_true = flatten(y_true)
+    y_pred = flatten(y_pred)
+    recall, precision, accuracy = [],[],[]
+    for a, b in zip(y_true, y_pred):
+        recall.append(recall_score(a, b, average=metric))
+        precision.append(precision_score(a, b, average=metric))
+        accuracy.append(accuracy_score(a, b))
+    return recall, precision, accuracy
+
+def rebuild_df(X, y):
+    df_X = pd.DataFrame(X)
+    df_y = pd.DataFrame(y)
+    df = pd.concat([df_X,df_y],axis=1)
+    df.columns = ["id","MRN","special_diagnosis","text"] +task_cols
+    return df
+
+def log_message(msg):
+    with open(f'logs/{measure}.txt', 'a') as f:
+        timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        f.write(f'[{timestamp}] {msg}\n')
+
+class MultiTaskDataset(Dataset):
+    def __init__(self, df, tokenizer, text_col, task_cols):
+        self.tokenizer = tokenizer
+        self.texts = df[text_col].values
+        self.task_labels = [df[col].values for col in task_cols]
+
+    def __len__(self):
+        return len(self.texts)
+
+    def __getitem__(self, idx):
+        text = str(self.texts[idx])
+        task_labels = [torch.tensor(label[idx]).long() for label in self.task_labels]
+
+        inputs = self.tokenizer.encode_plus(
+            text,
+            add_special_tokens=True,
+            max_length=512,
+            padding='max_length',
+            truncation=True,
+            return_token_type_ids=True,
+            return_attention_mask=True,
+            return_tensors='pt'
+        )
+
+        return inputs, task_labels
+
+class MultiTaskDataLoader:
+    def __init__(self, df, text_col, task_cols, tokenizer, batch_size, shuffle=True):
+        self.dataset = MultiTaskDataset(df, tokenizer, text_col, task_cols)
+        self.dataloader = DataLoader(self.dataset, batch_size=batch_size, shuffle=shuffle)
+
+    def __iter__(self):
+        for batch in self.dataloader:
+            inputs = {key: value.to(device) for key, value in batch[0].items()}
+            task_labels = [label.to(device) for label in batch[1]]
+            yield inputs, task_labels
+
+    def __len__(self):
+        return len(self.dataloader)
+class MultiTaskModel(torch.nn.Module):
+    def __init__(self, *num_classes):
+        super(MultiTaskModel, self).__init__()
+        self.bert = BertModel.from_pretrained('emilyalsentzer/Bio_ClinicalBERT')
+        
+        # Set requires_grad=True for the last layer parameters
+        for param in self.bert.encoder.layer[-1].parameters():
+            param.requires_grad = True
+
+        self.dropout = nn.Dropout(0.1)
+        self.num_classes = num_classes
+        self.num_tasks = len(num_classes)
+
+        if SIDE == "both":
+            for i in range(self.num_tasks):
+                setattr(self, f"task{i+1}_output", torch.nn.Linear(self.bert.config.hidden_size, num_classes[i]))
+        else:
+            for i in range(self.num_tasks):
+                setattr(self, f"task{i+1}_output", torch.nn.Linear(self.bert.config.hidden_size, num_classes[i]))
+
+    def forward(self, input_ids, token_type_ids, attention_mask):
+        # Pass input through BERT
+        outputs = self.bert(input_ids=input_ids, token_type_ids=token_type_ids, attention_mask=attention_mask)
+        pooled_output = self.dropout(outputs.pooler_output)
+
+        logits = []
+        for i in range(self.num_tasks):
+            task_logits = getattr(self, f"task{i+1}_output")(pooled_output)
+            logits.append(task_logits)
+
+        return logits
+    
+def format_scores(scores):
+    scores_np = scores.cpu().numpy()
+    scores_rounded = np.round(scores_np, 4)
+    return scores_rounded.tolist()
+
+def train(model, optimizer, train_loader, val_loader, num_epochs, patience):
+    criterion = nn.CrossEntropyLoss()
+    best_val_f1 = torch.zeros(1)
+    counter = 0
+    best_model_state_dict = None
+    
+    for epoch in range(num_epochs):
+        model.train()
+        total_loss = 0
+        for batch in train_loader:
+            input_ids = batch[0]["input_ids"].to(device).squeeze(1)
+            token_type_ids = batch[0]["token_type_ids"].to(device).squeeze(1)
+            attention_mask = batch[0]["attention_mask"].to(device).squeeze(1)
+            task_labels = [label.to(device) for label in batch[1]]
+            task_outputs = model(input_ids=input_ids, token_type_ids=token_type_ids, attention_mask=attention_mask)
+            task_losses = [criterion(output, labels) for output, labels in zip(task_outputs, task_labels)]
+            loss = sum(task_losses)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+
+        model.eval()
+        task_f1_scores = []
+        task_recall_scores = []
+        task_precision_scores = []
+        task_accuracy_scores = []
+        all_preds = []
+        all_labels = []
+        with torch.no_grad():
+            for batch in val_loader:
+                input_ids = batch[0]['input_ids'].to(device).squeeze(1)
+                token_type_ids = batch[0]["token_type_ids"].to(device).squeeze(1)
+                attention_mask = batch[0]['attention_mask'].to(device).squeeze(1)
+                task_labels = [label.to(device) for label in batch[1]]
+                task_outputs = model(input_ids, token_type_ids, attention_mask)
+                task_preds = [torch.argmax(output, dim=1) for output in task_outputs]
+                task_f1_scores.append([f1_score(labels.cpu(), preds.cpu(), average=metric)
+                                       for labels, preds in zip(task_labels, task_preds)])
+                all_labels.append(task_labels)
+                all_preds.append(task_preds)
+            task_f1_scores = torch.tensor(task_f1_scores).mean(dim=0)
+
+            val_f1 = task_f1_scores.mean()
+            if val_f1 > best_val_f1:
+                best_val_f1 = val_f1
+                counter = 0
+                best_model_state_dict = model.state_dict()
+            else:
+                counter += 1
+                if counter >= patience:
+                    break
+
+    if SIDE=="both":
+        best_model = MultiTaskModel(num_classes_task1, num_classes_task2, num_classes_task3, num_classes_task4, num_classes_task5,
+                                    num_classes_task6, num_classes_task7, num_classes_task8, num_classes_task9, num_classes_task10)
+    else:
+        best_model = MultiTaskModel(num_classes_task1, num_classes_task2, num_classes_task3, num_classes_task4, num_classes_task5)
+        
+    best_model.load_state_dict(best_model_state_dict)
+    return best_model, [best_val_f1,task_recall_scores,task_precision_scores,task_accuracy_scores]
+ 
+
+def eval_with_preds(model, val_loader, set_name, T=None):
+    model.eval()
+    task_f1_scores = []
+    task_f1_scores_macro = []
+    all_logits = []  # List to hold the logits
+    all_preds = []
+    all_labels = []
+    with torch.no_grad():
+        for batch in val_loader:
+            input_ids = batch[0]['input_ids'].to(device).squeeze(1)
+            token_type_ids = batch[0]["token_type_ids"].to(device).squeeze(1)
+            attention_mask = batch[0]['attention_mask'].to(device).squeeze(1)
+            task_labels = [label.to(device) for label in batch[1]]
+            task_outputs = model(input_ids, token_type_ids, attention_mask)
+            
+            if T: 
+                task_outputs = [value / T for value in task_outputs]
+            
+            task_preds = [torch.argmax(output, dim=1) for output in task_outputs]
+            task_f1_scores.append([f1_score(labels.cpu(), preds.cpu(), average=metric)
+                                    for labels, preds in zip(task_labels, task_preds)])
+ 
+            task_f1_scores_macro.append([f1_score(labels.cpu(), preds.cpu(), average="macro")
+                                    for labels, preds in zip(task_labels, task_preds)])
+            all_labels.append(task_labels)
+            all_preds.append(task_preds)
+            all_logits.append(task_outputs)  # Save the logits
+        task_f1_scores = torch.tensor(task_f1_scores).mean(dim=0)
+        task_f1_scores_macro = torch.tensor(task_f1_scores_macro).mean(dim=0)
+        task_f1_scores_rounded = format_scores(task_f1_scores)
+        task_f1_scores_rounded_macro = format_scores(task_f1_scores_macro)
+
+        val_f1 = task_f1_scores.mean()
+        val_f1_macro = task_f1_scores_macro.mean()
+
+        best_val_f1 = task_f1_scores_rounded
+        best_val_f1_macro = task_f1_scores_rounded_macro
+
+    # Return the best model based on validation F1 score
+    return [all_labels, all_preds, all_logits, val_f1.numpy(), best_val_f1, val_f1_macro.numpy(), best_val_f1_macro]
+
+def eval(model, val_loader, set_name, T=None):
+    [all_labels, all_preds, all_logits, average_f1_weighted, best_val_f1_weighted, average_f1_macro, best_val_f1_macro] = eval_with_preds(model, val_loader, set_name, T)
+    return [average_f1_weighted, best_val_f1_weighted, average_f1_macro, best_val_f1_macro]
+
+def encode(notes):
+    note_reps = []
+    for note in notes:
+        # Tokenize the note and obtain the input IDs, token type IDs, and attention mask
+        encoded_dict = tokenizer.encode_plus(
+                            note,
+                            add_special_tokens=True,
+                            max_length=512,
+                            pad_to_max_length=True,
+                            return_attention_mask=True,
+                            return_tensors='pt',
+                       )
+
+        input_ids = encoded_dict['input_ids'].to(device)
+        token_type_ids = encoded_dict['token_type_ids'].to(device)
+        attention_mask = encoded_dict['attention_mask'].to(device)
+        with torch.no_grad():
+            outputs = model.bert(input_ids=input_ids, token_type_ids=token_type_ids, attention_mask=attention_mask)
+            hidden_state = outputs[0][:, 0, :]
+
+        note_reps.append(hidden_state)
+    return note_reps
+
+from scipy.optimize import minimize
+def find_temperature(val_logits, val_labels):
+    def nll_temp(T):
+        return torch.nn.functional.cross_entropy(val_logits / T, val_labels).item()
+    res = minimize(nll_temp, x0=1.0, method='nelder-mead', options={'xatol': 1e-8})
+    return res.x[0]
+
+from scipy.stats import entropy
+from math import ceil
+
+def calculate_entropy(text, model):
+    inputs = tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length=512)
+    inputs = {k: v.to(device) for k, v in inputs.items()}  # Move input tensors to the device
+    
+    # print("predicting..")
+    with torch.no_grad():
+        logits_list = model(input_ids=inputs["input_ids"], token_type_ids=inputs["token_type_ids"], attention_mask=inputs["attention_mask"])
+        entropy_list = []
+        for task_index in tqdm(range(len(task_cols))):
+            task_logits = logits_list[task_index]
+            probabilities = torch.softmax(task_logits, dim=-1)
+            ent = entropy(probabilities.cpu().numpy()[0]) 
+            entropy_list.append(ent)
+    return entropy_list
+def compute_entropy(probabilities):
+    ent = -np.sum(probabilities * np.log2(probabilities + 1e-9))
+    return ent
+
+from scipy.optimize import minimize
+def find_temperature(val_logits, val_labels):
+    def nll_temp(T):
+        return torch.nn.functional.cross_entropy(val_logits / T, val_labels).item()
+    res = minimize(nll_temp, x0=1.0, method='nelder-mead', options={'xatol': 1e-8})
+    return res.x[0]
+
+measure = "entropy+temperature"
+metric = "weighted"
+SIDE = "both"
+
+text_col = 'text'  # Name of the column that contains the textual input
+task1_col = 'left central calyceal dilation'
+task2_col = 'left parenchymal appearance abnormal'
+task3_col = 'left parenchymal thickness abnormal'
+task4_col = 'left peripheral calyceal dilation'
+task5_col = 'left ureter abnormal'
+task6_col = 'right central calyceal dilation'
+task7_col = 'right parenchymal appearance abnormal'
+task8_col = 'right parenchymal thickness abnormal'
+task9_col = 'right peripheral calyceal dilation'
+task10_col = 'right ureter abnormal'
+
+
+task_cols = [task1_col, task2_col, task3_col, task4_col, task5_col,
+             task6_col, task7_col, task8_col, task9_col, task10_col]
+device = torch.device('cuda')
+tokenizer = BertTokenizer.from_pretrained('emilyalsentzer/Bio_ClinicalBERT')
+
+batch_size = 16
+num_epochs = 25
+lr = 5e-5
+patience = 3
+
+# Initialize the model and optimizer
+num_classes_task1 = 3
+num_classes_task2 = 3
+num_classes_task3 = 3
+num_classes_task4 = 3
+num_classes_task5 = 3
+num_classes_task6 = 3
+num_classes_task7 = 3
+num_classes_task8 = 3
+num_classes_task9 = 3
+num_classes_task10 = 3
+
+
+with open("seed.txt", "r") as file:
+    contents = file.read()
+    SEEDs = [int(s) for s in contents.split("\n") if s]
+
+for exp_num in [1,2,3,4,5,6,7,8,9,10]:
+    print(f"Experiment {exp_num}")
+    exp_folder = f"{measure}/exp{exp_num}/"
+    os.makedirs(f"{measure}/", exist_ok=True)
+    os.makedirs(exp_folder, exist_ok=True)
+
+    # SEED = random.randint(0, 2**32 - 1)
+    SEED = SEEDs[exp_num]
+    # with open("seed.txt","a") as file:
+    #     file.write(str(SEED)+"\n")
+
+    for iter_num in range(0,14):
+        if iter_num in [0,1,2,3,4,5,6]:
+            instance_num = 150
+        else:
+            instance_num = 250
+            
+        print(f"Round {iter_num}")
+        try:
+            data_path = f"{exp_folder}data/iter{iter_num+1}/"
+            os.makedirs(data_path, exist_ok=True)
+
+            iter_col = f"iter{iter_num}"
+            previous_iter_col = f"iter{iter_num-1}"
+
+            if iter_num!=0:
+                df = pd.read_csv(f"{exp_folder}data/train_test_{measure}.csv")
+            else:
+                df = pd.read_csv(f"data/train_test_v0(3.21).csv")
+                X_train, y_train, X_test, y_test = iterative_train_test_split(df[['id', 'MRN', 'special_diagnosis', 'text']].values, df[task_cols].values, test_size = 0.2)
+                train_df = rebuild_df(X_train, y_train)
+                test_df = rebuild_df(X_test, y_test)
+                df["set"] = "unlabled"
+                df.set.loc[df.id.isin(test_df.id.tolist())] = "test"
+
+            test_df = df[df.set=="test"]
+
+            if iter_num!=0:
+                iter_df = pd.read_csv(f"{exp_folder}data/iter{iter_num}/{measure}.csv")
+                train_val_df = df[~df[previous_iter_col].isna()]
+                iter_data = pd.concat([train_val_df, iter_df])
+            else:
+                iter_data = df[df.set!="test"].sample(instance_num, random_state=SEED)
+            len(iter_data.id.unique())
+
+            df[iter_col] = None
+            df[iter_col].loc[df.id.isin(iter_data.id.tolist())] = True
+
+            iter_cols = [c for c in df.columns if "iter" in c]
+            iter_cols
+
+            X_train, y_train, X_test, y_test = iterative_train_test_split(iter_data[['id', 'MRN', 'special_diagnosis', 'text']].values, iter_data[task_cols].values, test_size = 0.2)
+            train_df = rebuild_df(X_train, y_train)
+            val_df = rebuild_df(X_test, y_test)
+
+            df["set"] = "unlabled"
+            df.set.loc[df.id.isin(test_df.id.tolist())] = "test"
+            df.set.loc[df.id.isin(train_df.id.tolist())] = "train"
+            df.set.loc[df.id.isin(val_df.id.tolist())] = "val"
+
+            df.to_csv(f"{exp_folder}data/train_test_{measure}.csv",index=False)
+
+            val_results, test_results = [], []
+
+            # Create the training and validation data loaders
+            train_loader = MultiTaskDataLoader(train_df, text_col, task_cols, tokenizer, batch_size, shuffle=True)
+            val_loader = MultiTaskDataLoader(val_df, text_col, task_cols, tokenizer, batch_size, shuffle=False)
+            test_loader = MultiTaskDataLoader(test_df, text_col, task_cols, tokenizer, batch_size, shuffle=False)
+
+            model = MultiTaskModel(num_classes_task1, num_classes_task2, num_classes_task3, num_classes_task4, num_classes_task5,
+                              num_classes_task6, num_classes_task7, num_classes_task8, num_classes_task9, num_classes_task10)
+
+            optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+            model.to(device)
+            print("Training...")
+            best_model, best_scores = train(model, optimizer, train_loader, val_loader, num_epochs, patience)
+            os.makedirs(f'models/{exp_folder}/', exist_ok=True)
+            torch.save(best_model.state_dict(), f'models/{exp_folder}/iter{iter_num}_{measure}.pt')
+
+            print("Predicting...")
+            [average_f1_weighted, best_val_f1_weighted, average_f1_macro, best_val_f1_macro] = eval(best_model.to(device), val_loader, "validation")
+            log_message(f"Experiment {exp_num}, round {iter_num}")
+            log_message(f"Validation F1 weighted: {best_val_f1_weighted}; average F1_weighted: {average_f1_weighted}")
+            log_message(f"Validation F1 macro: {best_val_f1_macro}; average F1_macro: {average_f1_macro}")
+            
+            print("Looking for optimal T...")
+            ## outputs = [labels, preds, logits]
+            outputs = eval_with_preds(model.to(device), val_loader, "val") 
+            logits = [[t.cpu().numpy() for t in logit_batch] for logit_batch in outputs[2]]
+            logits = torch.tensor(np.vstack([np.vstack(arr) for arr in logits]))
+            labels = torch.tensor(np.concatenate([np.concatenate([t.cpu().numpy() for t in sublist]) for sublist in outputs[0]]))
+
+            T = find_temperature(logits, labels)
+            print(f"Temperature: {T}")
+            log_message(f"Temperature: {T}")
+
+            
+            [average_f1_weighted, best_val_f1_weighted, average_f1_macro, best_val_f1_macro] = eval(best_model.to(device), test_loader, "test", T=T)
+            log_message(f"Test F1 weighted: {best_val_f1_weighted}; average F1_weighted: {average_f1_weighted}")
+            log_message(f"Test F1 macro: {best_val_f1_macro}; average F1_macro: {average_f1_macro}")
+
+            print("Curating new data...")
+
+            unlabeled_df = df[(df.set!="test")&(df[f"iter{iter_num}"].isna())]
+            unlabeled_reps = encode(unlabeled_df.text.tolist())
+            unlabeled_emb = torch.cat(unlabeled_reps)
+            val_preds = flatten(outputs[1]).T
+            val_preds = pd.DataFrame(val_preds, columns=task_cols)
+            val_df = val_df.reset_index(drop=True)
+            unlabeled_emb.cpu().numpy()
+
+            model.to(device)
+
+            text = unlabeled_df["text"].tolist()
+            # Tokenize text and create input tensors
+            inputs = tokenizer(text, return_tensors="pt", 
+                               padding=True, truncation=True, max_length=512)
+            inputs = {k: v.to(device) for k, v in inputs.items()}  # Move input tensors to the device
+
+            num_batches = ceil(len(text) / batch_size)
+            entropy_list = []
+            # print("predicting..")
+
+            with torch.no_grad():
+                for idx, text_case in enumerate(text):
+                    input_case = tokenizer(text_case, return_tensors="pt", padding=True, truncation=True, max_length=512)
+                    input_case = {k: v.to(device) for k, v in input_case.items()}  # Move input tensors to the device
+
+                    logits_list = model(input_ids=input_case["input_ids"], token_type_ids=input_case["token_type_ids"], attention_mask=input_case["attention_mask"])
+
+                    entropy_case = []
+                    for task_index in range(len(logits_list)):
+                        task_logits = logits_list[task_index]
+                        probabilities = torch.softmax(task_logits, dim=-1).cpu().numpy().squeeze()
+                        ent = compute_entropy(probabilities)
+                        entropy_case.append(ent)
+
+                    entropy_list.append(entropy_case)
+                    
+            entropy_scores = np.vstack(entropy_list)
+            score_df = pd.DataFrame(entropy_scores)
+            score_df.columns = task_cols
+            new_series = pd.Series(np.sum(score_df, axis=1), index=score_df.index)
+            unlabeled_df = unlabeled_df.reset_index(drop=True)
+            unlabeled_df["entropy_score"] = new_series
+
+            unlabeled_df = unlabeled_df.sort_values("entropy_score", ascending=False)
+            unlabeled_df[:instance_num].to_csv(f"{exp_folder}data/iter{iter_num+1}/{measure}.csv",index=False)
+        except:
+            print("failed...")
+        
